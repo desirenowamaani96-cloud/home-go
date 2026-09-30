@@ -1,173 +1,84 @@
 const express = require('express');
-const { Configuration, OpenAIApi } = require('openai');
+const OpenAI = require('openai');
 const Device = require('../models/Device');
-const AIConversation = require('../models/AIConversation');
-const { verifyToken } = require('../middleware/auth');
-const http = require('http');
+const authMiddleware = require('../middleware/auth');
 
 const router = express.Router();
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(configuration);
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-// Send message to AI Agent
-router.post('/chat', verifyToken, async (req, res) => {
+router.post('/chat', authMiddleware, async (req, res) => {
   try {
     const { message } = req.body;
-    const userId = req.userId;
+    const devices = await Device.find({ userId: req.userId });
 
-    // Get user's devices
-    const devices = await Device.find({ userId });
-    const deviceList = devices.map(d => `${d.name} (${d.type}) - Currently ${d.status ? 'ON' : 'OFF'}`).join(', ');
-
-    // Get or create conversation
-    let conversation = await AIConversation.findOne({ userId });
-    if (!conversation) {
-      conversation = new AIConversation({ userId, messages: [] });
+    if (!message) {
+      return res.status(400).json({ message: 'Message is required' });
     }
 
-    // Add user message to history
-    conversation.messages.push({
-      role: 'user',
-      content: message
-    });
+    if (openai) {
+      const deviceList = devices.map(d => `${d.name} (${d.type}) is ${d.status ? 'ON' : 'OFF'}`).join(', ');
+      const prompt = `You are HomeGo AI, a smart home assistant. User has these devices: ${deviceList}. If user asks to turn on/off a device, respond with JSON: {"action":"ON","device":"device name"} or {"action":"OFF","device":"device name"}. Otherwise respond naturally.`;
 
-    // Build system prompt
-    const systemPrompt = `You are HomeGo AI Assistant, a smart home control assistant. 
-    The user has the following devices: ${deviceList}
-    
-    When the user asks to control devices:
-    1. Identify the device they want to control
-    2. Determine the action (turn on/off)
-    3. Provide a friendly response about what you're doing
-    
-    If you detect a control command, format it as: [CONTROL_ACTION: deviceName|action]
-    For example: [CONTROL_ACTION: Living Room Light|ON]
-    
-    Always be helpful, friendly, and concise. Understand natural language commands like:
-    - "Turn on the lights"
-    - "Can you switch off the TV?"
-    - "I need the bedroom fan running"
-    - "Show me device status"`;
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: prompt },
+          { role: 'user', content: message }
+        ]
+      });
 
-    // Call OpenAI API
-    const response = await openai.createChatCompletion({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...conversation.messages.map(msg => ({
-          role: msg.role,
-          content: msg.content
-        }))
-      ],
-      temperature: 0.7,
-      max_tokens: 500
-    });
+      const output = completion.choices[0].message.content;
+      let parsed = null;
 
-    const aiMessage = response.data.choices[0].message.content;
-
-    // Parse control actions from AI response
-    const controlActions = [];
-    const controlRegex = /\[CONTROL_ACTION: (.+?)\|(.+?)\]/g;
-    let match;
-    while ((match = controlRegex.exec(aiMessage)) !== null) {
-      const [_, deviceName, action] = match;
-      const device = devices.find(d => d.name.toLowerCase() === deviceName.toLowerCase());
-      if (device) {
-        controlActions.push({
-          deviceId: device._id,
-          action: action.toUpperCase()
-        });
-        // Execute device control
-        await sendCommandToHardware(device, action.toUpperCase() === 'ON' ? 1 : 0);
+      try {
+        parsed = JSON.parse(output);
+      } catch {
+        parsed = null;
       }
-    }
 
-    // Remove control action tags from response
-    const cleanedMessage = aiMessage.replace(/\[CONTROL_ACTION: .+?\|.+?\]/g, '').trim();
+      if (parsed && parsed.device && (parsed.action === 'ON' || parsed.action === 'OFF')) {
+        const target = devices.find(d => d.name.toLowerCase() === parsed.device.toLowerCase());
+        if (target) {
+          target.status = parsed.action === 'ON' ? 1 : 0;
+          target.lastUpdated = new Date();
+          await target.save();
 
-    // Add AI response to history
-    conversation.messages.push({
-      role: 'assistant',
-      content: cleanedMessage
-    });
-
-    if (controlActions.length > 0) {
-      conversation.deviceActionsExecuted.push(...controlActions);
-      // Update device status
-      for (const action of controlActions) {
-        const device = devices.find(d => d._id.toString() === action.deviceId.toString());
-        if (device) {
-          device.status = action.action === 'ON' ? 1 : 0;
-          device.lastUpdated = new Date();
-          await device.save();
+          return res.json({
+            response: `${target.name} has been turned ${parsed.action.toLowerCase()}.`,
+            action: parsed.action,
+            device: target.name
+          });
         }
       }
+
+      return res.json({ response: output });
     }
 
-    await conversation.save();
+    const lower = message.toLowerCase();
 
-    // Broadcast device updates via WebSocket
-    const io = req.app.get('io');
-    controlActions.forEach(action => {
-      io.emit('device_updated', {
-        deviceId: action.deviceId,
-        status: action.action === 'ON' ? 1 : 0
-      });
-    });
+    for (const device of devices) {
+      if (lower.includes('turn on') && lower.includes(device.name.toLowerCase())) {
+        device.status = 1;
+        device.lastUpdated = new Date();
+        await device.save();
+        return res.json({ response: `${device.name} is now ON.`, action: 'ON', device: device.name });
+      }
 
-    res.json({
-      message: cleanedMessage,
-      actions: controlActions,
-      conversationId: conversation._id
-    });
-  } catch (error) {
-    console.error('AI Error:', error);
-    res.status(500).json({ message: 'AI service error', error: error.message });
-  }
-});
+      if (lower.includes('turn off') && lower.includes(device.name.toLowerCase())) {
+        device.status = 0;
+        device.lastUpdated = new Date();
+        await device.save();
+        return res.json({ response: `${device.name} is now OFF.`, action: 'OFF', device: device.name });
+      }
+    }
 
-// Get conversation history
-router.get('/history', verifyToken, async (req, res) => {
-  try {
-    const conversation = await AIConversation.findOne({ userId: req.userId });
-    res.json(conversation || { messages: [] });
+    res.json({ response: 'I can help with your smart home devices. Try: turn on living room light.' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
-
-// Helper function to send command to hardware
-async function sendCommandToHardware(device, status) {
-  return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({
-      command: status === 1 ? 'ON' : 'OFF',
-      deviceId: device.hardwareId
-    });
-
-    const options = {
-      hostname: device.ipAddress,
-      port: device.port,
-      path: '/api/control',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': postData.length
-      }
-    };
-
-    const req = http.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve(JSON.parse(data)));
-    });
-
-    req.on('error', reject);
-    req.write(postData);
-    req.end();
-  });
-}
 
 module.exports = router;
